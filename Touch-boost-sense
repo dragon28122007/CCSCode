@@ -1,0 +1,353 @@
+//  ACLK = VLO = 12kHz, MCLK = SMCLK = 1MHz DCO
+//
+//               MSP430G2xx3
+//             -----------------
+//         /|\|              XIN|-
+//          | |                 |
+//          --|RST          XOUT|-
+//            |                 |
+//            |             P2.0|<--Capacitive Touch Input B (base)
+//            |                 |
+//  LED 1  <--|P1.4>3       P2.1|<--Capacitive Touch Input L (Left)
+//  LED 2  <--|P1.5>3           |
+//  LED 3  <--|P1.6>3       P2.2|<--Capacitive Touch Input D (Down)
+//  LED 4  <--|P1.7>3           |
+//  LED 5  <--|P1.3>4       P2.3|<--Capacitive Touch Input R (Right)
+//  LED 6  <--|P1.3>5           |
+//  LED 7  <--|P1.3>6       P2.4|<--Capacitive Touch Input U (Up)
+//  LED 8  <--|P1.3>7           |
+//  LED 9  <--|P1.0         P2.5|<--Capacitive Touch Input M (Middle)
+//
+//	Use Timer0 for the capacitive detecting.
+//	Use Timer1 for change modes and pulse LED_9 - show the mode is active at that moment.
+//
+//  Author: Vu Long.
+//  January, 2015.
+//******************************************************************************
+
+
+#include <msp430.h>
+
+/* Define User Configuration values */
+/*----------------------------------*/
+/* Defines WDT SMCLK interval for sensor measurements*/
+#define WDT_meas_setting (DIV_SMCLK_512)
+/* Defines WDT ACLK interval for delay between measurement cycles*/
+#define WDT_delay_setting (DIV_ACLK_512)
+
+/* Sensor settings*/
+#define NUM_SEN     6                       				// Defines number of sensors
+#define NUM_MODE    3                       				// Defines number of modes
+#define KEY_LVL     450                     				// Defines threshold for a key press
+/*Set to ~ half the max delta expected*/
+
+/* Definitions for use with the WDT settings*/
+#define DIV_ACLK_32768  (WDT_ADLY_1000)     				// ACLK/32768
+#define DIV_ACLK_8192   (WDT_ADLY_250)      				// ACLK/8192
+#define DIV_ACLK_512    (WDT_ADLY_16)       				// ACLK/512
+#define DIV_ACLK_64     (WDT_ADLY_1_9)      				// ACLK/64
+#define DIV_SMCLK_32768 (WDT_MDLY_32)       				// SMCLK/32768
+#define DIV_SMCLK_8192  (WDT_MDLY_8)        				// SMCLK/8192
+#define DIV_SMCLK_512   (WDT_MDLY_0_5)     					// SMCLK/512
+#define DIV_SMCLK_64    (WDT_MDLY_0_064)    				// SMCLK/64
+
+#define LED_9   (0x01)                      				// P1.0 - LED 9 MID-LED output
+
+// Global variables for sensing
+unsigned int base_cnt[NUM_SEN];
+unsigned int meas_cnt[NUM_SEN];
+int delta_cnt[NUM_SEN];
+unsigned char key_press[NUM_SEN];
+unsigned char nofpad;
+char key_pressed;
+int cycles;
+char mode = 1;
+unsigned char k = 0, l = 0;
+
+// char Turn_on_T0A0 = 0;
+const unsigned char electrode_bit[NUM_SEN]={BIT0, BIT1, BIT2, BIT3, BIT4, BIT5};
+/* System Routines*/
+void measure_count(void);                   				// Measures each capacitive sensor
+void pulse_LED_type_1(void);                				// Prepare for use
+void pulse_LED_type_2(void);                				// LED gradient routine
+void LED_n(char n);											// LED_n output n: 0 ---> 8
+void Doit(unsigned char n, char mode);						// Do something
+void Timera1_init();										// Set Timer A1
+
+/* Main Function*/
+int main(void)
+{
+  unsigned int i,j;											// Counting variables
+  WDTCTL = WDTPW + WDTHOLD;                 				// Stop watchdog timer
+  if (CALBC1_1MHZ==0xFF)									// If calibration constant erased
+  {
+    while(1);                               				// do not load, trap CPU!!
+  }
+
+  DCOCTL = 0;                               				// Select lowest DCOx and MODx settings
+  BCSCTL1 = CALBC1_1MHZ;                    				// Set DCO to 1MHz
+  DCOCTL =  CALDCO_1MHZ;
+  BCSCTL3 |= LFXT1S_2;                      				// LFXT1 = VLO
+  IE1 |= WDTIE;                             				// enable WDT interrupt
+  P1SEL = 0x00;                             				// No XTAL
+  P1DIR |= BIT0 + BIT3 + BIT4 + BIT5 +BIT6 + BIT7;  		// P1.0,3,4,5,6,7 = LEDs, Out = 1
+  P1OUT = 0x00;												// Turn off all LEDs
+   __bis_SR_register(GIE);                  				// Enable interrupts
+
+   Timera1_init();											// Setup timer A0 to control LED_9 (P1.0) and M_pad (P2.5)
+
+  measure_count();                          				// Establish baseline capacitance
+  for (i = 0; i<NUM_SEN; i++)
+    base_cnt[i] = meas_cnt[i];
+
+  for(i=15; i>0; i--)                       				// Repeat and avg base measurement
+  {
+    measure_count();
+    for (j = 0; j<NUM_SEN; j++)
+      base_cnt[j] = (meas_cnt[j]+base_cnt[j])/2;
+  }
+
+  pulse_LED_type_1();										// Ready for use
+
+  /* Main loop starts here*/
+  while (1)
+  {
+    j = KEY_LVL;
+    key_pressed = 0;                        				// Assume no keys are pressed
+
+    measure_count();                        				// Measure all sensors
+
+    for (i = 0; i<NUM_SEN; i++)
+    {
+      delta_cnt[i] = base_cnt[i] - meas_cnt[i];  			// Calculate delta: c_change
+
+      /* Handle baseline measurment for a base C decrease*/
+      if (delta_cnt[i] < 0)                 				// If negative: result increased
+      {                                     				// beyond baseline, i.e. cap dec
+          base_cnt[i] = (base_cnt[i]+meas_cnt[i]) >> 1; 	// Re-average quickly
+          delta_cnt[i] = 0;                 				// Zero out for pos determination
+      }
+      if (delta_cnt[i] > j)                 				// Determine if each key is pressed
+      {                                     				// per a preset threshold
+        key_press[i] = 1;                   				// Specific key pressed
+        j = delta_cnt[i];
+      }
+      else
+        key_press[i] = 0;
+    }
+
+    /* Count the number of pressed keys */
+    for (i=0; i<NUM_SEN; i++)
+    {
+   		key_pressed += key_press[i];
+    }
+
+    /* Delay to next sample, sample more slowly if no keys are pressed*/
+    if (key_pressed)
+    {
+      BCSCTL1 = (BCSCTL1 & 0x0CF) + DIVA_0; 				// ACLK/(0:1,1:2,2:4,3:8)
+      cycles = 20;
+    }
+    else
+    {
+      cycles--;
+      if (cycles > 0)
+        BCSCTL1 = (BCSCTL1 & 0x0CF) + DIVA_0; 				// ACLK/(0:1,1:2,2:4,3:8)
+      else
+      {
+        BCSCTL1 = (BCSCTL1 & 0x0CF) + DIVA_3; 				// ACLK/(0:1,1:2,2:4,3:8)
+        cycles = 0;
+      }
+    }
+    WDTCTL = WDT_delay_setting;             				// WDT, ACLK, interval timer
+
+    /* Handle baseline measurment for a base C increase*/
+    if (!key_pressed)                       				// Only adjust baseline down
+    {                                       				// if no keys are touched
+      for (i = 0; i<NUM_SEN; i++)
+        base_cnt[i] = base_cnt[i] - 1;      				// Adjust baseline down, should be
+    }                                       				// slow to accomodate for genuine
+    														// changes in sensor C
+
+    /* Detect the real-pressed-pad - The largest pad which is touched */
+    if (key_pressed)
+    {
+		int press_max = KEY_LVL;
+		for (i = 0; i<NUM_SEN; i++)
+		{
+			if (key_press[i]&(delta_cnt[i]>press_max))
+			{
+				press_max = delta_cnt[i];
+				nofpad = i;
+			}
+		}
+		Doit(nofpad,mode);
+    }
+    __bis_SR_register(LPM3_bits + GIE);
+  }
+}
+// End Main
+
+/* Measure count result (capacitance) of each sensor*/
+/* Routine setup for four sensors, not dependent on NUM_SEN value!*/
+
+void measure_count(void)
+{
+  char i;
+
+  TA0CTL = TASSEL_3 + MC_2;                   				// TBCLK, cont mode
+  TA0CCTL1 = CM_3 + CCIS_2 + CAP;               			// Pos&Neg,GND,Cap
+
+  for (i = 0; i<NUM_SEN; i++)
+  {
+    /*Configure Ports for relaxation oscillator*/
+    /*The P2SEL2 register allows Timer_A to receive it's clock from a GPIO*/
+    /*See the Application Information section of the device datasheet for info*/
+    P2DIR &= ~ electrode_bit[i];
+    P2SEL &= ~ electrode_bit[i];
+    P2SEL2 |= electrode_bit[i];
+
+    /*Setup Gate Timer*/
+    WDTCTL = WDT_meas_setting;              				// WDT, ACLK, interval timer
+    TA0CTL |= TACLR;                        				// Clear Timer_A TAR
+    __bis_SR_register(LPM0_bits+GIE);       				// Wait for WDT interrupt
+    TA0CCTL1 ^= CCIS0;                					    // Create SW capture of CCR1
+    meas_cnt[i] = TACCR1;                   				// Save result
+    WDTCTL = WDTPW + WDTHOLD;               				// Stop watchdog timer
+    P2SEL2 &= ~electrode_bit[i];
+  }
+}
+
+void pulse_LED_type_1(void)
+{
+	P1OUT = 0xF1;
+	_delay_cycles(100000);
+	P1OUT = 0x09;
+	_delay_cycles(100000);
+	P1OUT = LED_9;
+}
+
+void LED_n(char n)
+{
+	switch (n)
+	{
+		case 1: 	{ P1OUT = (P1OUT ^ BIT4) & ~(BIT3); break; }
+		case 2: 	{ P1OUT = (P1OUT ^ BIT5) & ~(BIT3); break; }
+		case 3: 	{ P1OUT = (P1OUT ^ BIT6) & ~(BIT3); break; }
+		case 4: 	{ P1OUT = (P1OUT ^ BIT7) & ~(BIT3); break; }
+		case 5: 	{ P1OUT = (P1OUT | BIT3) ^ (BIT4); break; }
+		case 6: 	{ P1OUT = (P1OUT | BIT3) ^ (BIT5); break; }
+		case 7: 	{ P1OUT = (P1OUT | BIT3) ^ (BIT6); break; }
+		case 8: 	{ P1OUT = (P1OUT | BIT3) ^ (BIT7); break; }
+	}
+}
+
+void Doit(unsigned char n, char mode)
+{
+	switch (mode)
+	{
+	case 1:
+	{
+		switch (n)
+		{
+		case 0: { break; }
+		case 1: { LED_n(1); break; }
+		case 2: { LED_n(2); break; }
+		case 3: { LED_n(3); break; }
+		case 4: { LED_n(4); break; }
+		case 5: { P1OUT = P1OUT | BIT3 & (~0xF0); break; }
+		}
+	}
+	case 2:
+	{
+		P1OUT = BIT4;										// Turn on LED_1 and turn off the others
+		unsigned char LED_on = 1;
+		switch (n)
+		{
+		case 0: { 	P1OUT = BIT4 ; break; }					// Pad Base B
+		case 1: { 	LED_n(LED_on);
+					if (LED_on>4) LED_on -= 4; 				// Pad Left L
+					LED_n(LED_on);
+					break; }
+		case 2: { 	LED_n(LED_on);							// Pad Down D
+					if (LED_on == 4) LED_on = 1;
+					else if (LED_on == 8) LED_on = 5;
+					else LED_on +=1;
+					LED_n(LED_on);
+					break; }
+		case 3: { 	LED_n(LED_on);
+					if (LED_on<5) LED_on += 4; 				// Pad Right R
+					LED_n(LED_on);
+					break; }
+		case 4: { 	LED_n(LED_on);							// Pad Up U
+					if (LED_on == 1) LED_on = 4;
+					else if (LED_on == 5) LED_on = 8;
+					else LED_on -=1;
+					LED_n(LED_on);
+					break; }
+		case 5: {	LED_n(LED_on);							// Pad Middle M
+					LED_on += 1;
+					if (LED_on == 9) LED_on = 1;
+					LED_n(LED_on);
+					break;
+				}
+		}
+	}
+	}
+}
+
+/*
+Timer Init
+Setup timer A1 to work with VLO(12Khz), Continuous Mode and Enable Interrupt Overflow
+*/
+void Timera1_init()
+{
+	WDTCTL = WDTPW + WDTHOLD;                 				// Stop WDT
+	TA1CTL = TASSEL_1 + MC_2 + TAIE;						// Setup Timer A0 control: ACLK clock, Continous mode, Enable
+	TA1CCTL0 = CCIE;                   				        // CCR0 interrupt enabled
+	TA1CCTL1 = CCIE;                   				        // CCR1 interrupt enabled
+	TA1CCR0 = 62500;										// 0.5s
+	TA1CCR1 = 31250;										// 0.25s
+}
+
+/*Timer1 A0 interrupt service routine */
+#pragma vector=TIMER1_A0_VECTOR
+__interrupt void Timer1_A0_Itr (void)
+{
+	if (nofpad == 5)
+	{
+		l += 1;
+		if (l == 7) l = 1;
+		else if (l == 6) { mode += 1; if (mode > NUM_MODE) mode = 1; }
+	}
+	else l = 1;
+}
+
+/*Timer1 A1 interrupt service routine */
+#pragma vector=TIMER1_A1_VECTOR
+__interrupt void TAIV_Interrupt (void)
+{
+	switch (TA1IV)
+	{
+	case 0x02:
+	{
+		if (k <= mode)
+		{
+			P1OUT |= LED_9;
+			k += 1;
+			if (k == 7) k=1;
+		}
+		break;
+	}
+	case 0x0A:
+	{	P1OUT &= ~LED_9; 	}
+	}
+}
+
+/* Watchdog Timer interrupt service routine */
+#pragma vector=WDT_VECTOR
+__interrupt void watchdog_timer(void)
+{
+  TA0CCTL1 ^= CCIS0;                        				// Create SW capture of CCR1
+  __bic_SR_register_on_exit(LPM3_bits);     				// Exit LPM3 on reti
+}
